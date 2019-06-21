@@ -17,7 +17,8 @@ from torch.nn.functional import cross_entropy, softmax
 from pytorch_pretrained_bert.modeling import BertPreTrainedModel
 import warnings
 warnings.filterwarnings("ignore")
-
+import math
+from loss import FocalLoss
 # Set parameters
 LabelList = ['TIN', 'UNT']
 BERTModel = 'bert-base-uncased'
@@ -58,7 +59,7 @@ def custom_loss(predict, labels):
     precision = tp / (predict.sum(dim=0) + 1e-8)
     recall = tp / (target.sum(dim=0) + 1e-8)
     f1 = 2 * (precision * recall / (precision + recall + 1e-8))
-    return 1 - f1.mean(), CE
+    return (1 - f1.mean()), CE
 
 
 class F1_BertForSequenceClassification(BertPreTrainedModel):
@@ -71,6 +72,7 @@ class F1_BertForSequenceClassification(BertPreTrainedModel):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.classifier = nn.Linear(config.hidden_size, num_labels)
         self.apply(self.init_bert_weights)
+        self.focal_loss = FocalLoss(num_labels)
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None, head_mask=None):
         outputs = self.bert(input_ids, token_type_ids, attention_mask,
@@ -83,8 +85,7 @@ class F1_BertForSequenceClassification(BertPreTrainedModel):
         logits = self.classifier(pooled_output)
 
         if labels is not None:
-            return custom_loss(logits.view(-1, self.num_labels), labels.view(-1))
-
+            return custom_loss(logits.view(-1, self.num_labels), labels.view(-1))[0], self.focal_loss(logits.view(-1, self.num_labels), labels.view(-1))
         elif self.output_attentions:
             return all_attentions, logits
         return logits
@@ -171,7 +172,7 @@ if __name__ == "__main__":
     train_batch_size = train_batch_size // gradient_accumulation_steps
     output_dir = OutputDir
     num_train_epochs = NUMofEPOCH
-    num_train_optimization_steps = int(len(
+    num_train_optimization_steps = math.ceil(len(
         TrainExamples) / train_batch_size / gradient_accumulation_steps) * num_train_epochs
     cache_dir = CacheDir
     warmup_proportion = 0.1
@@ -232,22 +233,22 @@ if __name__ == "__main__":
             batch = tuple(t.to(device) for t in batch)
             input_ids, input_mask, segment_ids, label_ids = batch
             f1, ce = Model(input_ids, segment_ids, input_mask, label_ids)
-    alpha = (epoch+1)/float(num_train_epochs)
-    loss = alpha * f1 + (1 - alpha)*ce
-    if n_gpu > 1:
-        loss = loss.mean()  # mean() to average on multi-gpu.
-    if gradient_accumulation_steps > 1:
-        loss = loss / gradient_accumulation_steps
+            alpha = (epoch)/float(num_train_epochs)
+            loss = 0.2*f1 + 0.8*ce
+            if n_gpu > 1:
+                loss = loss.mean()  # mean() to average on multi-gpu.
+            if gradient_accumulation_steps > 1:
+                loss = loss / gradient_accumulation_steps
 
-    loss.backward()
+            loss.backward()
 
-    tr_loss += loss.item()
-    nb_tr_examples += input_ids.size(0)
-    nb_tr_steps += 1
-    if (step + 1) % gradient_accumulation_steps == 0:
-        optimizer.step()
-        optimizer.zero_grad()
-        global_step += 1
+            tr_loss += loss.item()
+            nb_tr_examples += input_ids.size(0)
+            nb_tr_steps += 1
+            if (step + 1) % gradient_accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+                global_step += 1
 
 
     # Save a trained model and the associated configuration
